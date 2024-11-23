@@ -9,6 +9,11 @@ function parseArguments() {
             type: 'array',
             describe: 'List of agent profile paths',
         })
+        .option('port', {
+            type: 'number',
+            describe: 'Port to run the application on',
+            default: 3000,  // You can set a default port if desired
+        })
         .help()
         .alias('help', 'h')
         .parse();
@@ -21,7 +26,8 @@ function getProfiles(args) {
 function main() {
     const args = parseArguments();
     const profiles = getProfiles(args);
-    console.log(profiles);
+    const port = args.port;  // Get the port argument
+    console.log(`Running on port: ${port}`);
     const { load_memory, init_message } = settings;
 
     for (let i=0; i<profiles.length; i++) {
