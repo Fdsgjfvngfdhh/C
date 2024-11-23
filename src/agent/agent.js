@@ -8,18 +8,24 @@ import { ActionManager } from './action_manager.js';
 import { NPCContoller } from './npc/controller.js';
 import { MemoryBank } from './memory_bank.js';
 import { SelfPrompter } from './self_prompter.js';
+import { isOtherAgent, initConversationManager, sendToBot, endAllChats, responseScheduledFor} from './conversation.js';
 import { handleTranslation, handleEnglishTranslation } from '../utils/translator.js';
 import { addViewer } from './viewer.js';
 import settings from '../../settings.js';
+import { serverProxy } from './server_proxy.js';
 
 export class Agent {
     async start(profile_fp, load_mem=false, init_message=null, count_id=0) {
+        this.last_sender = null;
         try {
             // Add validation for profile_fp
             if (!profile_fp) {
                 throw new Error('No profile filepath provided');
             }
 
+            // Connect to MindServer via proxy
+            serverProxy.connect();
+            
             console.log('Starting agent initialization with profile:', profile_fp);
             
             // Initialize components with more detailed error handling
@@ -39,6 +45,11 @@ export class Agent {
                 this.memory_bank = new MemoryBank();
                 console.log('Initializing self prompter...');
                 this.self_prompter = new SelfPrompter(this);
+                initConversationManager(this);
+                
+                // After getting the name, register with MindServer via proxy
+                serverProxy.registerAgent(this.name);
+                
             } catch (error) {
                 throw new Error(`Failed to initialize agent components: ${error.message || error}`);
             }
@@ -133,19 +144,31 @@ export class Agent {
             "Gamerule "
         ];
         
-        const eventname = settings.profiles.length > 1 ? 'whisper' : 'chat';
-        this.bot.on(eventname, async (username, message) => {
+        const respondFunc = async (username, message) => {
+            if (username === this.name) return;
             try {
-                if (username === this.name) return;
-                
                 if (ignore_messages.some((m) => message.startsWith(m))) return;
 
                 this.shut_up = false;
-                await this.handleMessage(username, message);
+
+                console.log(this.name, 'received message from', username, ':', message);
+
+                if (isOtherAgent(username)) {
+                    //recieveFromBot(username, message);
+                    console.warn('recieved whisper from other bot??')
+                }
+                else {
+                    let translation = await handleEnglishTranslation(message);
+                    this.handleMessage(username, translation);
+                }
             } catch (error) {
                 console.error('Error handling message:', error);
             }
-        });
+        }
+
+        this.bot.on('whisper', respondFunc);
+        if (settings.profiles.length === 1)
+            this.bot.on('chat', respondFunc);
 
         // Set up auto-eat
         this.bot.autoEat.options = {
@@ -166,13 +189,16 @@ export class Agent {
                 this.history.add('system', prompt);
                 await this.self_prompter.start(prompt);
             }
+            else if (save_data?.last_sender) {
+                this.last_sender = save_data.last_sender;
+                await this.handleMessage('system', `You have restarted and this message is auto-generated. Continue the conversation with ${this.last_sender}`);
+            }
             else if (init_message) {
                 await this.handleMessage('system', init_message, 2);
             }
             else {
                 const translation = await handleTranslation("Hello world! I am "+this.name);
                 this.bot.chat(translation);
-                this.bot.emit('finished_executing');
             }
         } catch (error) {
             console.error('Error handling startup conditions:', error);
@@ -192,27 +218,20 @@ export class Agent {
         this.bot.interrupt_code = false;
     }
 
-    async cleanChat(message, translate_up_to=-1) {
-        let to_translate = message;
-        let remainging = '';
-        if (translate_up_to != -1) {
-            to_translate = to_translate.substring(0, translate_up_to);
-            remainging = message.substring(translate_up_to);
-        }
-        message = (await handleTranslation(to_translate)).trim() + " " + remainging;
-        // newlines are interpreted as separate chats, which triggers spam filters. replace them with spaces
-        message = message.replaceAll('\n', ' ');
-        return this.bot.chat(message);
-    }
-
     shutUp() {
         this.shut_up = true;
         if (this.self_prompter.on) {
             this.self_prompter.stop(false);
         }
+        endAllChats();
     }
 
     async handleMessage(source, message, max_responses=null) {
+        if (!source || !message) {
+            console.warn('Received empty message from', source);
+            return false;
+        }
+
         let used_command = false;
         if (max_responses === null) {
             max_responses = settings.max_commands === -1 ? Infinity : settings.max_commands;
@@ -221,10 +240,10 @@ export class Agent {
             max_responses = Infinity;
         }
 
-        let self_prompt = source === 'system' || source === this.name;
+        const self_prompt = source === 'system' || source === this.name;
+        const from_other_bot = isOtherAgent(source);
 
-        // First check for user commands
-        if (!self_prompt) {
+        if (!self_prompt && !from_other_bot) { // from user, check for forced commands
             const user_command_name = containsCommand(message);
             if (user_command_name) {
                 if (!commandExists(user_command_name)) {
@@ -233,23 +252,25 @@ export class Agent {
                 }
                 this.bot.chat(`*${source} used ${user_command_name.substring(1)}*`);
                 if (user_command_name === '!newAction') {
-                    // all user initiated commands are ignored by the bot except for this one
+                    // all user-initiated commands are ignored by the bot except for this one
                     // add the preceding message to the history to give context for newAction
                     this.history.add(source, message);
                 }
                 let execute_res = await executeCommand(this, message);
                 if (execute_res) 
-                    this.cleanChat(execute_res);
+                    this.routeResponse(source, execute_res);
                 return true;
             }
         }
+
+        if (!self_prompt)
+            this.last_sender = source;
 
         // Now translate the message
         message = await handleEnglishTranslation(message);
         console.log('received message from', source, ':', message);
 
-        // Do self prompting
-        const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up;
+        const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up || responseScheduledFor(source);
 
         let behavior_log = this.bot.modes.flushBehaviorLog();
         if (behavior_log.trim().length > 0) {
@@ -265,6 +286,7 @@ export class Agent {
         await this.history.add(source, message);
         this.history.save();
 
+
         if (!self_prompt && this.self_prompter.on) // message is from user during self-prompting
             max_responses = 1; // force only respond to this message, then let self-prompting take over
         for (let i=0; i<max_responses; i++) {
@@ -278,13 +300,10 @@ export class Agent {
                 console.log(`Full response: ""${res}""`)
                 res = truncCommandMessage(res); // everything after the command is ignored
                 this.history.add(this.name, res);
+                
                 if (!commandExists(command_name)) {
                     this.history.add('system', `Command ${command_name} does not exist.`);
                     console.warn('Agent hallucinated command:', command_name)
-                    continue;
-                }
-                if (command_name === '!stopSelfPrompt' && self_prompt) {
-                    this.history.add('system', `Cannot stopSelfPrompt unless requested by user.`);
                     continue;
                 }
 
@@ -292,14 +311,14 @@ export class Agent {
                 this.self_prompter.handleUserPromptedCmd(self_prompt, isAction(command_name));
 
                 if (settings.verbose_commands) {
-                    this.cleanChat(res, res.indexOf(command_name));
+                    this.routeResponse(source, res, res.indexOf(command_name));
                 }
                 else { // only output command name
                     let pre_message = res.substring(0, res.indexOf(command_name)).trim();
                     let chat_message = `*used ${command_name.substring(1)}*`;
                     if (pre_message.length > 0)
                         chat_message = `${pre_message}  ${chat_message}`;
-                    this.cleanChat(res);
+                    this.routeResponse(source, chat_message);
                 }
 
                 let execute_res = await executeCommand(this, res);
@@ -314,15 +333,44 @@ export class Agent {
             }
             else { // conversation response
                 this.history.add(this.name, res);
-                this.cleanChat(res);
+                this.routeResponse(source, res);
                 console.log('Purely conversational response:', res);
                 break;
             }
+            
             this.history.save();
         }
 
-        this.bot.emit('finished_executing');
         return used_command;
+    }
+
+    async routeResponse(to_player, message, translate_up_to=-1) {
+        let self_prompt = to_player === 'system' || to_player === this.name;
+        if (self_prompt && this.last_sender && !this.self_prompter.on) {
+            // this is for when the agent is prompted by system while still in conversation
+            // so it can respond to events like death but be routed back to the last sender
+            to_player = this.last_sender;
+        }
+
+        if (isOtherAgent(to_player)) {
+            sendToBot(to_player, message);
+            return;
+        }
+
+        let to_translate = message;
+        let remaining = '';
+        if (translate_up_to != -1) {
+            to_translate = to_translate.substring(0, translate_up_to);
+            remaining = message.substring(translate_up_to);
+        }
+        message = (await handleTranslation(to_translate)).trim() + " " + remaining;
+        // newlines are interpreted as separate chats, which triggers spam filters. replace them with spaces
+        message = message.replaceAll('\n', ' ');
+
+        if (self_prompt) 
+            this.bot.chat(message);
+        else
+            this.bot.whisper(to_player, message);
     }
 
     startEvents() {
@@ -416,7 +464,7 @@ export class Agent {
     
     cleanKill(msg='Killing agent process...') {
         this.history.add('system', msg);
-        this.bot.chat('Goodbye world.')
+        this.bot.chat('Restarting.')
         this.history.save();
         process.exit(1);
     }
