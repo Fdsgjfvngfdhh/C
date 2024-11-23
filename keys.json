@@ -1,11 +1,11 @@
 {
-    "OPENAI_API_KEY": "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",
-    "OPENAI_ORG_ID": "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",
-    "GEMINI_API_KEY": "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",
+    "OPENAI_API_KEY": "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",
+    "OPENAI_ORG_ID": "org-A8LN0fpkUH9LR5F2715e5Hqy",
+    "GEMINI_API_KEY": "AIzaSyAZee0zz4lwlE0GdtNHaBqgiyX81oHI8Fs",
     "ANTHROPIC_API_KEY": "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",
     "REPLICATE_API_KEY": "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",
-    "GROQCLOUD_API_KEY": "xai-A2NLYCFEmN1uVdjbUCh3KJdeCncdGfEPHkIwPvBfFE8gHAoSzsbcuHqFAiI2sllvm7LKLsY5o0mow2J4",
-    "HUGGINGFACE_API_KEY": "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",
-    "QWEN_API_KEY": "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",
+    "GROQCLOUD_API_KEY": "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",
+    "HUGGINGFACE_API_KEY": "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",
+    "QWEN_API_KEY": "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",
     "XAI_API_KEY": "xai-A2NLYCFEmN1uVdjbUCh3KJdeCncdGfEPHkIwPvBfFE8gHAoSzsbcuHqFAiI2sllvm7LKLsY5o0mow2J4"
 }
