@@ -2,12 +2,181 @@ import * as mc from "../../utils/mcdata.js";
 import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
 import Vec3 from 'vec3';
-
+import fs form 'fs';  
+import path from 'path';
 
 export function log(bot, message, chat=false) {
     bot.output += message + '\n';
     if (chat)
         bot.chat(message);
+}
+
+// Add this new function
+async function captureView(bot, x, y, z, description = '') {
+    // Validate coordinates with more detailed error messages
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+        throw new Error(`Invalid coordinates: x=${x}, y=${y}, z=${z}. All must be finite numbers.`);
+    }
+
+    // Ensure bot is connected
+    if (!bot || !bot.entity) {
+        throw new Error('Bot is not connected or initialized');
+    }
+
+    // Logging for debugging
+    console.log(`Attempting to capture view at (${x}, ${y}, ${z})`);
+
+    try {
+        // Look at specified coordinates with error handling
+        const targetPos = new Vec3(x, y, z);
+        await bot.lookAt(targetPos);
+    } catch (lookError) {
+        console.error(`Failed to look at coordinates: ${lookError.message}`);
+        throw new Error(`Could not look at specified coordinates: ${lookError.message}`);
+    }
+
+    // Screenshot capture with more robust error handling
+    let screenshot;
+    try {
+        screenshot = await bot.screenshot();
+        if (!screenshot) {
+            throw new Error('Screenshot capture returned null or undefined');
+        }
+    } catch (screenshotError) {
+        console.error(`Screenshot capture failed: ${screenshotError.message}`);
+        throw new Error(`Failed to capture screenshot: ${screenshotError.message}`);
+    }
+
+    // Directory management
+    const capturesDir = path.join(process.cwd(), 'captures');
+    try {
+        if (!fs.existsSync(capturesDir)) {
+            fs.mkdirSync(capturesDir, { recursive: true });
+        }
+    } catch (dirError) {
+        console.error(`Failed to create captures directory: ${dirError.message}`);
+        throw new Error(`Could not create captures directory: ${dirError.message}`);
+    }
+
+    // Filename generation with more uniqueness
+    const timestamp = Date.now();
+    const randomSuffix = Math.random().toString(36).substring(7);
+    const filename = `screenshot_${timestamp}_${randomSuffix}.png`;
+    const filepath = path.join(capturesDir, filename);
+
+    // Save screenshot with error handling
+    try {
+        fs.writeFileSync(filepath, screenshot);
+        console.log(`Screenshot saved: ${filepath}`);
+    } catch (saveError) {
+        console.error(`Failed to save screenshot: ${saveError.message}`);
+        throw new Error(`Could not save screenshot: ${saveError.message}`);
+    }
+
+    // Metadata generation
+    const metadata = {
+        coordinates: { x, y, z },
+        block: bot.blockAt(targetPos),
+        environment: {
+            biome: world.getBiomeName(bot),
+            time: bot.time.timeOfDay,
+            weather: bot.rainState > 0 ? 'Rainy' : 'Clear',
+            timestamp: new Date().toISOString()
+        }
+    };
+
+    return {
+        imagePath: filepath,
+        metadata: metadata,
+        description: description || generateDescription(metadata)
+    };
+}
+
+// Helper function for description
+function generateDescription(metadata) {
+    const timeOfDay = 
+        metadata.environment.time < 6000 ? 'Morning' :
+        metadata.environment.time < 12000 ? 'Afternoon' :
+        metadata.environment.time < 18000 ? 'Evening' : 'Night';
+
+    return `Captured at: ${metadata.environment.timestamp}
+    Location: (${metadata.coordinates.x.toFixed(2)}, ${metadata.coordinates.y.toFixed(2)}, ${metadata.coordinates.z.toFixed(2)})
+    Biome: ${metadata.environment.biome}
+    Time: ${timeOfDay}
+    Weather: ${metadata.environment.weather}
+    Block: ${metadata.block?.name || 'Unknown'}`;
+}
+
+function manageScreenshotDirectory(maxScreenshots = 100) {
+    const capturesDir = path.join(process.cwd(), 'captures');
+    
+    try {
+        const files = fs.readdirSync(capturesDir)
+            .filter(file => file.endsWith('.png'))
+            .map(file => ({
+                name: file,
+                path: path.join(capturesDir, file),
+                stats: fs.statSync(path.join(capturesDir, file))
+            }))
+            .sort((a, b) => b.stats.birthtimeMs - a.stats.birthtimeMs);
+
+        // Remove oldest screenshots if over limit
+        while (files.length > maxScreenshots) {
+            const oldestFile = files.pop();
+            try {
+                fs.unlinkSync(oldestFile.path);
+                console.log(`Removed old screenshot: ${oldestFile.name}`);
+            } catch (error) {
+                console.error(`Failed to remove old screenshot: ${error.message}`);
+            }
+        }
+    } catch (error) {
+        console.error(`Screenshot directory management failed: ${error.message}`);
+    }
+}
+
+async function compressImage(filepath) {
+    try {
+        // Requires 'sharp' npm package
+        const sharp = require('sharp');
+        const compressedPath = filepath.replace('.png', '_compressed.png');
+        
+        await sharp(filepath)
+            .resize({ width: 800, withoutEnlargement: true }) // Resize, but don't enlarge
+            .png({ compressionLevel: 8, adaptiveFiltering: true }) // Compression settings
+            .toFile(compressedPath);
+
+        // Optionally, replace original with compressed
+        fs.unlinkSync(filepath);
+        fs.renameSync(compressedPath, filepath);
+    } catch (error) {
+        console.error(`Image compression failed: ${error.message}`);
+    }
+}
+
+function logScreenshot(filepath, metadata) {
+    const logFile = path.join(process.cwd(), 'captures', 'screenshot_log.json');
+    
+    let logs = [];
+    try {
+        if (fs.existsSync(logFile)) {
+            logs = JSON.parse(fs.readFileSync(logFile, 'utf8'));
+        }
+    } catch (error) {
+        console.error('Failed to read log file:', error);
+    }
+
+    logs.push({
+        filepath,
+        timestamp: new Date().toISOString(),
+        metadata
+    });
+
+    try {
+        fs.writeFileSync(logFile, JSON.stringify(logs, null, 2));
+    } catch (error) {
+        console.error('Failed to write log file:', error);
+    }
 }
 
 async function autoLight(bot) {
@@ -18,6 +187,14 @@ async function autoLight(bot) {
         } catch (err) {return false;}
     }
     return false;
+}
+
+const sharp = require('sharp');
+
+async function compressImage(filepath) {
+    await sharp(filepath)
+        .resize(800) // Resize to a width of 800 pixels, maintaining aspect ratio
+        .toFile(filepath.replace('.png', '_compressed.png'));
 }
 
 async function equipHighestAttack(bot) {
@@ -1250,6 +1427,8 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
     }
     return true;
 }
+
+
 
 export async function activateNearestBlock(bot, type) {
     /**
